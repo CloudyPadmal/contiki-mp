@@ -83,6 +83,11 @@
 #define PRINTF(...)
 #endif
 
+/* Log configuration */
+#include "sys/log.h"
+#define LOG_MODULE "IEEE-MODE"
+#define LOG_LEVEL LOG_LEVEL_MAC
+
 /* Configuration to enable/disable auto ACKs in IEEE mode */
 #ifdef IEEE_MODE_CONF_AUTOACK
 #define IEEE_MODE_AUTOACK IEEE_MODE_CONF_AUTOACK
@@ -258,6 +263,8 @@ static uint32_t ieee_overrides[] = {
 /*---------------------------------------------------------------------------*/
 static int on(void);
 static int off(void);
+static radio_result_t generate_carrier(bool enable, int channel, int power, 
+  bool modulated);
 /*---------------------------------------------------------------------------*/
 /**
  * \brief Checks whether the RFC domain is accessible and the RFC is in IEEE RX
@@ -1499,8 +1506,109 @@ set_object(radio_param_t param, const void *src, size_t size)
 
     return rv;
   }
+
+  if(param == RADIO_POWER_MODE_CARRIER_ON || param == RADIO_POWER_MODE_CARRIER_OFF) {
+    int channel = ((int *)src)[0];
+    int power = ((int *)src)[1];
+    bool modulated = ((int *)src)[2] == 1;
+    
+    return generate_carrier(
+      param == RADIO_POWER_MODE_CARRIER_ON, 
+      channel, 
+      power, 
+      modulated
+    );
+  }
+  
   return RADIO_RESULT_NOT_SUPPORTED;
 }
+
+static radio_result_t
+generate_carrier(bool enable, int channel, int power, bool modulated)
+{
+  uint32_t setupcmd_status;
+  rfc_CMD_RADIO_SETUP_t setupcmd;
+  uint32_t carriercmd_status;
+  rfc_CMD_TX_TEST_t carriercmd;
+  uint32_t freqcmd_status;
+  rfc_CMD_FS_t freqcmd;
+
+  /* If we are off, turn on first */
+  if(!rf_is_on() & enable) {
+    if(on() != RF_CORE_CMD_OK) {
+      return RADIO_RESULT_ERROR;
+    }
+  } 
+
+  if (!enable) {
+    soft_off();
+    LOG_INFO("Carrier is off\n");
+    return RADIO_RESULT_OK;
+  }
+
+  rf_core_restart_rat();
+
+  memset(&setupcmd, 0x00, sizeof(setupcmd));
+  setupcmd.commandNo = CMD_RADIO_SETUP;
+  setupcmd.condition.rule = 0x01;
+  setupcmd.mode = 0x01;
+  setupcmd.txPower = output_power[power].tx_power;
+
+  memset(&freqcmd, 0x00, sizeof(freqcmd));
+  freqcmd.commandNo = CMD_FS;
+  freqcmd.condition.rule = 0x01;
+  freqcmd.frequency = 2350 + (5 * channel);
+  freqcmd.synthConf.bTxMode = 0x01;
+
+  memset(&carriercmd, 0x00, sizeof(carriercmd));
+  carriercmd.commandNo = CMD_TX_TEST;
+  carriercmd.condition.rule = 0x01;
+  carriercmd.config.whitenMode = 0x02;
+  carriercmd.txWord = modulated ? 0xAAAA : 0xFFFF;
+  carriercmd.endTrigger.triggerType = 0x01;
+  carriercmd.syncWord = 0x71764129;
+
+  if(rf_core_send_cmd((uint32_t)&setupcmd, &setupcmd_status) == RF_CORE_CMD_ERROR) {
+    LOG_ERR("Radio Setup Error: CMDSTA=0x%08lx status=0x%04x\n", setupcmd_status, setupcmd.status);
+    return RADIO_RESULT_ERROR;
+  }
+
+  /* Wait until radio setup is done */
+  if(rf_core_wait_cmd_done(&setupcmd) != RF_CORE_CMD_OK) {
+    LOG_ERR("Radio Setup: wait, CMDSTA=0x%08lx, status=0x%04x\n",
+           setupcmd_status, setupcmd.status);
+    return RF_CORE_CMD_ERROR;
+  }
+
+  if(rf_core_send_cmd((uint32_t)&freqcmd, &freqcmd_status) == RF_CORE_CMD_ERROR) {
+    LOG_ERR("Frequency Synthesizer Error: CMDSTA=0x%08lx\n", freqcmd_status);
+    return RADIO_RESULT_ERROR;
+  }
+
+  /* Wait until frequency synthersizer command is done */
+  if(rf_core_wait_cmd_done(&freqcmd) != RF_CORE_CMD_OK) {
+    LOG_ERR("Frequency Synthesizer: wait, CMDSTA=0x%08lx, status=0x%04x\n",
+           freqcmd_status, freqcmd.status);
+    return RF_CORE_CMD_ERROR;
+  }
+
+  if(rf_core_send_cmd((uint32_t)&carriercmd, &carriercmd_status) == RF_CORE_CMD_ERROR) {
+    LOG_ERR("Carrier Generator Error: CMDSTA=0x%08lx\n", carriercmd_status);
+    return RADIO_RESULT_ERROR;
+  }
+
+  /* Verify that the carrier generator command is active */
+  if((carriercmd.status & RF_CORE_RADIO_OP_STATUS_ACTIVE) == RF_CORE_RADIO_OP_STATUS_ACTIVE) {
+    LOG_ERR("Carrier Generator: inactive, CMDSTA=0x%08lx, status=0x%04x\n",
+           carriercmd_status, carriercmd.status);
+    return RF_CORE_CMD_ERROR;
+  }
+
+  LOG_INFO("Carrier is on\n");
+
+  return RADIO_RESULT_OK;
+}
+
 /*---------------------------------------------------------------------------*/
 const struct radio_driver ieee_mode_driver = {
   init,
